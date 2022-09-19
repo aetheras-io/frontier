@@ -16,19 +16,20 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
+mod lru_cache;
+
 use std::{
 	collections::{BTreeMap, HashMap},
 	marker::PhantomData,
 	sync::{Arc, Mutex},
 };
 
+use self::lru_cache::LRUCacheByteLimited;
 use ethereum::BlockV2 as EthereumBlock;
 use ethereum_types::{H256, U256};
 use futures::StreamExt;
-use lru::LruCache;
 use tokio::sync::{mpsc, oneshot};
 
-use codec::Decode;
 use sc_client_api::{
 	backend::{Backend, StateBackend, StorageProvider},
 	client::BlockchainEvents,
@@ -38,7 +39,7 @@ use sp_api::ProvideRuntimeApi;
 use sp_blockchain::HeaderBackend;
 use sp_runtime::{
 	generic::BlockId,
-	traits::{BlakeTwo256, Block as BlockT, Header as HeaderT, UniqueSaturatedInto, Zero},
+	traits::{BlakeTwo256, Block as BlockT, Header as HeaderT, UniqueSaturatedInto},
 };
 
 use fc_rpc_core::types::*;
@@ -49,6 +50,8 @@ use crate::{
 	frontier_backend_client,
 	overrides::{OverrideHandle, StorageOverride},
 };
+
+type WaitList<Hash, T> = HashMap<Hash, Vec<oneshot::Sender<Option<T>>>>;
 
 enum EthBlockDataCacheMessage<B: BlockT> {
 	RequestCurrentBlock {
@@ -76,23 +79,31 @@ enum EthBlockDataCacheMessage<B: BlockT> {
 /// These are large and take a lot of time to fetch from the database.
 /// Storing them in an LRU cache will allow to reduce database accesses
 /// when many subsequent requests are related to the same blocks.
-pub struct EthBlockDataCache<B: BlockT>(mpsc::Sender<EthBlockDataCacheMessage<B>>);
+pub struct EthBlockDataCacheTask<B: BlockT>(mpsc::Sender<EthBlockDataCacheMessage<B>>);
 
-impl<B: BlockT> EthBlockDataCache<B> {
+impl<B: BlockT> EthBlockDataCacheTask<B> {
 	pub fn new(
 		spawn_handle: SpawnTaskHandle,
 		overrides: Arc<OverrideHandle<B>>,
-		blocks_cache_size: usize,
-		statuses_cache_size: usize,
+		blocks_cache_max_size: usize,
+		statuses_cache_max_size: usize,
+		prometheus_registry: Option<prometheus_endpoint::Registry>,
 	) -> Self {
 		let (task_tx, mut task_rx) = mpsc::channel(100);
 		let outer_task_tx = task_tx.clone();
 		let outer_spawn_handle = spawn_handle.clone();
 
-		outer_spawn_handle.spawn("EthBlockDataCache", None, async move {
-			let mut blocks_cache = LruCache::<B::Hash, EthereumBlock>::new(blocks_cache_size);
-			let mut statuses_cache =
-				LruCache::<B::Hash, Vec<TransactionStatus>>::new(statuses_cache_size);
+		outer_spawn_handle.spawn("EthBlockDataCacheTask", None, async move {
+			let mut blocks_cache = LRUCacheByteLimited::<B::Hash, EthereumBlock>::new(
+				"blocks_cache",
+				blocks_cache_max_size as u64,
+				prometheus_registry.clone(),
+			);
+			let mut statuses_cache = LRUCacheByteLimited::<B::Hash, Vec<TransactionStatus>>::new(
+				"statuses_cache",
+				statuses_cache_max_size as u64,
+				prometheus_registry,
+			);
 
 			let mut awaiting_blocks =
 				HashMap::<B::Hash, Vec<oneshot::Sender<Option<EthereumBlock>>>>::new();
@@ -178,8 +189,8 @@ impl<B: BlockT> EthBlockDataCache<B> {
 
 	fn request_current<T, F>(
 		spawn_handle: &SpawnTaskHandle,
-		cache: &mut LruCache<B::Hash, T>,
-		wait_list: &mut HashMap<B::Hash, Vec<oneshot::Sender<Option<T>>>>,
+		cache: &mut LRUCacheByteLimited<B::Hash, T>,
+		wait_list: &mut WaitList<B::Hash, T>,
 		overrides: Arc<OverrideHandle<B>>,
 		block_hash: B::Hash,
 		schema: EthereumStorageSchema,
@@ -187,7 +198,7 @@ impl<B: BlockT> EthBlockDataCache<B> {
 		task_tx: mpsc::Sender<EthBlockDataCacheMessage<B>>,
 		handler_call: F,
 	) where
-		T: Clone,
+		T: Clone + codec::Encode,
 		F: FnOnce(&Box<dyn StorageOverride<B> + Send + Sync>) -> EthBlockDataCacheMessage<B>,
 		F: Send + 'static,
 	{
@@ -207,9 +218,9 @@ impl<B: BlockT> EthBlockDataCache<B> {
 
 		// Data is neither cached nor already requested, so we start fetching
 		// the data.
-		wait_list.insert(block_hash.clone(), vec![response_tx]);
+		wait_list.insert(block_hash, vec![response_tx]);
 
-		spawn_handle.spawn("EthBlockDataCache Worker", None, async move {
+		spawn_handle.spawn("EthBlockDataCacheTask Worker", None, async move {
 			let handler = overrides
 				.schemas
 				.get(&schema)
@@ -276,92 +287,6 @@ where
 	BE: Backend<B> + 'static,
 	BE::State: StateBackend<BlakeTwo256>,
 {
-	/// Task that caches at which best hash a new EthereumStorageSchema was inserted in the Runtime Storage.
-	pub async fn ethereum_schema_cache_task(client: Arc<C>, backend: Arc<fc_db::Backend<B>>) {
-		use fp_storage::PALLET_ETHEREUM_SCHEMA;
-		use log::warn;
-		use sp_storage::{StorageData, StorageKey};
-
-		if let Ok(None) = frontier_backend_client::load_cached_schema::<B>(backend.as_ref()) {
-			let mut cache: Vec<(EthereumStorageSchema, H256)> = Vec::new();
-			let id = BlockId::Number(Zero::zero());
-			if let Ok(Some(header)) = client.header(id) {
-				let genesis_schema_version = frontier_backend_client::onchain_storage_schema::<
-					B,
-					C,
-					BE,
-				>(client.as_ref(), id);
-				cache.push((genesis_schema_version, header.hash()));
-				let _ = frontier_backend_client::write_cached_schema::<B>(backend.as_ref(), cache)
-					.map_err(|err| {
-						warn!("Error schema cache insert for genesis: {:?}", err);
-					});
-			} else {
-				warn!("Error genesis header unreachable");
-			}
-		}
-
-		// Subscribe to changes for the pallet-ethereum Schema.
-		if let Ok(mut stream) = client.storage_changes_notification_stream(
-			Some(&[StorageKey(PALLET_ETHEREUM_SCHEMA.to_vec())]),
-			None,
-		) {
-			while let Some(notification) = stream.next().await {
-				let (hash, changes) = (notification.block, notification.changes);
-				// Make sure only block hashes marked as best are referencing cache checkpoints.
-				if hash == client.info().best_hash {
-					// Just map the change set to the actual data.
-					let storage: Vec<Option<StorageData>> = changes
-						.iter()
-						.filter_map(|(o_sk, _k, v)| {
-							if o_sk.is_none() {
-								Some(v.cloned())
-							} else {
-								None
-							}
-						})
-						.collect();
-					for change in storage {
-						if let Some(data) = change {
-							// Decode the wrapped blob which's type is known.
-							let new_schema: EthereumStorageSchema =
-								Decode::decode(&mut &data.0[..]).unwrap();
-							// Cache new entry and overwrite the old database value.
-							if let Ok(Some(old_cache)) =
-								frontier_backend_client::load_cached_schema::<B>(backend.as_ref())
-							{
-								let mut new_cache: Vec<(EthereumStorageSchema, H256)> = old_cache;
-								match &new_cache[..] {
-									[.., (schema, _)] if *schema == new_schema => {
-										warn!(
-											"Schema version already in Frontier database, ignoring: {:?}",
-											new_schema
-										);
-									}
-									_ => {
-										new_cache.push((new_schema, hash));
-										let _ = frontier_backend_client::write_cached_schema::<B>(
-											backend.as_ref(),
-											new_cache,
-										)
-										.map_err(|err| {
-											warn!(
-												"Error schema cache insert for genesis: {:?}",
-												err
-											);
-										});
-									}
-								}
-							} else {
-								warn!("Error schema cache is corrupted");
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-
 	pub async fn filter_pool_task(
 		client: Arc<C>,
 		filter_pool: Arc<Mutex<BTreeMap<U256, FilterPoolItem>>>,
@@ -375,24 +300,7 @@ where
 					*notification.header.number(),
 				);
 
-				// BTreeMap::retain is unstable :c.
-				// 1. We collect all keys to remove.
-				// 2. We remove them.
-				let remove_list: Vec<_> = filter_pool
-					.iter()
-					.filter_map(|(&k, v)| {
-						let lifespan_limit = v.at_block + retain_threshold;
-						if lifespan_limit <= imported_number {
-							Some(k)
-						} else {
-							None
-						}
-					})
-					.collect();
-
-				for key in remove_list {
-					filter_pool.remove(&key);
-				}
+				filter_pool.retain(|_, v| v.at_block + retain_threshold > imported_number);
 			}
 		}
 	}
@@ -444,7 +352,7 @@ where
 			let base_fee = if let Some(base_fee) = handler.base_fee(&id) {
 				base_fee
 			} else {
-				client.runtime_api().gas_price(&id).unwrap_or(U256::zero())
+				client.runtime_api().gas_price(&id).unwrap_or_else(|_|U256::zero())
 			};
 			let receipts = handler.current_receipts(&id);
 			let mut result = FeeHistoryCacheItem {
@@ -512,7 +420,6 @@ where
 						}
 						None
 					})
-					.map(|r| r)
 					.collect();
 			} else {
 				result.rewards = reward_percentiles.iter().map(|_| 0).collect();
@@ -561,7 +468,7 @@ where
 				if let Some(tree_route) = notification.tree_route {
 					if let Ok(fee_history_cache) = &mut fee_history_cache.lock() {
 						// Remove retracted.
-						let _ = tree_route.retracted().iter().map(|hash_and_number| {
+						let _lock = tree_route.retracted().iter().map(|hash_and_number| {
 							let n = UniqueSaturatedInto::<u64>::unique_saturated_into(
 								hash_and_number.number,
 							);

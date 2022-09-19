@@ -18,9 +18,11 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 mod precompile;
+mod validation;
 
 use codec::{Decode, Encode};
 pub use evm::ExitReason;
+use frame_support::weights::Weight;
 #[cfg(feature = "std")]
 use serde::{Deserialize, Serialize};
 use sp_core::{H160, U256};
@@ -30,7 +32,13 @@ pub use evm::backend::{Basic as Account, Log};
 
 pub use self::precompile::{
 	Context, ExitError, ExitRevert, ExitSucceed, LinearCostPrecompile, Precompile,
-	PrecompileFailure, PrecompileOutput, PrecompileResult, PrecompileSet,
+	PrecompileFailure, PrecompileHandle, PrecompileOutput, PrecompileResult, PrecompileSet,
+	Transfer,
+};
+
+pub use self::validation::{
+	CheckEvmTransaction, CheckEvmTransactionConfig, CheckEvmTransactionInput,
+	InvalidEvmTransactionError,
 };
 
 #[derive(Clone, Eq, PartialEq, Encode, Decode, Default)]
@@ -79,11 +87,11 @@ pub struct GenesisAccount {
 /// Trait that outputs the current transaction gas price.
 pub trait FeeCalculator {
 	/// Return the minimal required gas price.
-	fn min_gas_price() -> U256;
+	fn min_gas_price() -> (U256, Weight);
 }
 
 impl FeeCalculator for () {
-	fn min_gas_price() -> U256 {
-		U256::zero()
+	fn min_gas_price() -> (U256, Weight) {
+		(U256::zero(), 0u64)
 	}
 }

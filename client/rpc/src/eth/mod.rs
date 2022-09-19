@@ -22,6 +22,7 @@ mod client;
 mod execute;
 mod fee;
 mod filter;
+mod format;
 mod mining;
 mod state;
 mod submit;
@@ -31,8 +32,7 @@ use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
 
 use ethereum::{BlockV2 as EthereumBlock, TransactionV2 as EthereumTransaction};
 use ethereum_types::{H160, H256, H512, H64, U256, U64};
-use futures::future::BoxFuture;
-use jsonrpc_core::Result;
+use jsonrpsee::core::{async_trait, RpcResult as Result};
 
 use sc_client_api::backend::{Backend, StateBackend, StorageProvider};
 use sc_network::{ExHashT, NetworkService};
@@ -47,17 +47,18 @@ use sp_runtime::{
 	traits::{BlakeTwo256, Block as BlockT, UniqueSaturatedInto},
 };
 
-use fc_rpc_core::{types::*, EthApi as EthApiT};
+use fc_rpc_core::{types::*, EthApiServer};
 use fp_rpc::{ConvertTransactionRuntimeApi, EthereumRuntimeRPCApi, TransactionStatus};
 
 use crate::{internal_err, overrides::OverrideHandle, public_key, signer::EthSigner};
 
 pub use self::{
-	cache::{EthBlockDataCache, EthTask},
-	filter::EthFilterApi,
+	cache::{EthBlockDataCacheTask, EthTask},
+	filter::EthFilter,
 };
 
-pub struct EthApi<B: BlockT, C, P, CT, BE, H: ExHashT, A: ChainApi> {
+/// Eth API implementation.
+pub struct Eth<B: BlockT, C, P, CT, BE, H: ExHashT, A: ChainApi> {
 	pool: Arc<P>,
 	graph: Arc<Pool<A>>,
 	client: Arc<C>,
@@ -67,13 +68,13 @@ pub struct EthApi<B: BlockT, C, P, CT, BE, H: ExHashT, A: ChainApi> {
 	signers: Vec<Box<dyn EthSigner>>,
 	overrides: Arc<OverrideHandle<B>>,
 	backend: Arc<fc_db::Backend<B>>,
-	block_data_cache: Arc<EthBlockDataCache<B>>,
-	fee_history_limit: u64,
+	block_data_cache: Arc<EthBlockDataCacheTask<B>>,
 	fee_history_cache: FeeHistoryCache,
+	fee_history_cache_limit: FeeHistoryCacheLimit,
 	_marker: PhantomData<(B, BE)>,
 }
 
-impl<B: BlockT, C, P, CT, BE, H: ExHashT, A: ChainApi> EthApi<B, C, P, CT, BE, H, A> {
+impl<B: BlockT, C, P, CT, BE, H: ExHashT, A: ChainApi> Eth<B, C, P, CT, BE, H, A> {
 	pub fn new(
 		client: Arc<C>,
 		pool: Arc<P>,
@@ -84,9 +85,9 @@ impl<B: BlockT, C, P, CT, BE, H: ExHashT, A: ChainApi> EthApi<B, C, P, CT, BE, H
 		overrides: Arc<OverrideHandle<B>>,
 		backend: Arc<fc_db::Backend<B>>,
 		is_authority: bool,
-		block_data_cache: Arc<EthBlockDataCache<B>>,
-		fee_history_limit: u64,
+		block_data_cache: Arc<EthBlockDataCacheTask<B>>,
 		fee_history_cache: FeeHistoryCache,
+		fee_history_cache_limit: FeeHistoryCacheLimit,
 	) -> Self {
 		Self {
 			client,
@@ -99,14 +100,15 @@ impl<B: BlockT, C, P, CT, BE, H: ExHashT, A: ChainApi> EthApi<B, C, P, CT, BE, H
 			overrides,
 			backend,
 			block_data_cache,
-			fee_history_limit,
 			fee_history_cache,
+			fee_history_cache_limit,
 			_marker: PhantomData,
 		}
 	}
 }
 
-impl<B, C, P, CT, BE, H: ExHashT, A> EthApiT for EthApi<B, C, P, CT, BE, H, A>
+#[async_trait]
+impl<B, C, P, CT, BE, H: ExHashT, A> EthApiServer for Eth<B, C, P, CT, BE, H, A>
 where
 	B: BlockT<Hash = H256> + Send + Sync + 'static,
 	C: ProvideRuntimeApi<B> + StorageProvider<B, BE>,
@@ -121,6 +123,7 @@ where
 	// ########################################################################
 	// Client
 	// ########################################################################
+
 	fn protocol_version(&self) -> Result<u64> {
 		self.protocol_version()
 	}
@@ -149,20 +152,12 @@ where
 	// Block
 	// ########################################################################
 
-	fn block_by_hash(
-		&self,
-		hash: H256,
-		full: bool,
-	) -> BoxFuture<'static, Result<Option<RichBlock>>> {
-		self.block_by_hash(hash, full)
+	async fn block_by_hash(&self, hash: H256, full: bool) -> Result<Option<RichBlock>> {
+		self.block_by_hash(hash, full).await
 	}
 
-	fn block_by_number(
-		&self,
-		number: BlockNumber,
-		full: bool,
-	) -> BoxFuture<'static, Result<Option<RichBlock>>> {
-		self.block_by_number(number, full)
+	async fn block_by_number(&self, number: BlockNumber, full: bool) -> Result<Option<RichBlock>> {
+		self.block_by_number(number, full).await
 	}
 
 	fn block_transaction_count_by_hash(&self, hash: H256) -> Result<Option<U256>> {
@@ -197,28 +192,29 @@ where
 	// Transaction
 	// ########################################################################
 
-	fn transaction_by_hash(&self, hash: H256) -> BoxFuture<'static, Result<Option<Transaction>>> {
-		self.transaction_by_hash(hash)
+	async fn transaction_by_hash(&self, hash: H256) -> Result<Option<Transaction>> {
+		self.transaction_by_hash(hash).await
 	}
 
-	fn transaction_by_block_hash_and_index(
+	async fn transaction_by_block_hash_and_index(
 		&self,
 		hash: H256,
 		index: Index,
-	) -> BoxFuture<'static, Result<Option<Transaction>>> {
-		self.transaction_by_block_hash_and_index(hash, index)
+	) -> Result<Option<Transaction>> {
+		self.transaction_by_block_hash_and_index(hash, index).await
 	}
 
-	fn transaction_by_block_number_and_index(
+	async fn transaction_by_block_number_and_index(
 		&self,
 		number: BlockNumber,
 		index: Index,
-	) -> BoxFuture<'static, Result<Option<Transaction>>> {
+	) -> Result<Option<Transaction>> {
 		self.transaction_by_block_number_and_index(number, index)
+			.await
 	}
 
-	fn transaction_receipt(&self, hash: H256) -> BoxFuture<'static, Result<Option<Receipt>>> {
-		self.transaction_receipt(hash)
+	async fn transaction_receipt(&self, hash: H256) -> Result<Option<Receipt>> {
+		self.transaction_receipt(hash).await
 	}
 
 	// ########################################################################
@@ -249,12 +245,12 @@ where
 		self.call(request, number)
 	}
 
-	fn estimate_gas(
+	async fn estimate_gas(
 		&self,
 		request: CallRequest,
 		number: Option<BlockNumber>,
-	) -> BoxFuture<'static, Result<U256>> {
-		self.estimate_gas(request, number)
+	) -> Result<U256> {
+		self.estimate_gas(request, number).await
 	}
 
 	// ########################################################################
@@ -306,12 +302,12 @@ where
 	// Submit
 	// ########################################################################
 
-	fn send_transaction(&self, request: TransactionRequest) -> BoxFuture<'static, Result<H256>> {
-		self.send_transaction(request)
+	async fn send_transaction(&self, request: TransactionRequest) -> Result<H256> {
+		self.send_transaction(request).await
 	}
 
-	fn send_raw_transaction(&self, bytes: Bytes) -> BoxFuture<'static, Result<H256>> {
-		self.send_raw_transaction(bytes)
+	async fn send_raw_transaction(&self, bytes: Bytes) -> Result<H256> {
+		self.send_raw_transaction(bytes).await
 	}
 }
 
@@ -321,7 +317,6 @@ fn rich_block_build(
 	hash: Option<H256>,
 	full_transactions: bool,
 	base_fee: Option<U256>,
-	is_eip1559: bool,
 ) -> RichBlock {
 	Rich {
 		inner: Block {
@@ -343,10 +338,7 @@ fn rich_block_build(
 				logs_bloom: block.header.logs_bloom,
 				timestamp: U256::from(block.header.timestamp / 1000),
 				difficulty: block.header.difficulty,
-				seal_fields: vec![
-					Bytes(block.header.mix_hash.as_bytes().to_vec()),
-					Bytes(block.header.nonce.as_bytes().to_vec()),
-				],
+				nonce: Some(block.header.nonce),
 				size: Some(U256::from(rlp::encode(&block.header).len() as u32)),
 			},
 			total_difficulty: U256::zero(),
@@ -363,7 +355,6 @@ fn rich_block_build(
 									transaction.clone(),
 									Some(block.clone()),
 									Some(statuses[index].clone().unwrap_or_default()),
-									is_eip1559,
 									base_fee,
 								)
 							})
@@ -390,7 +381,6 @@ fn transaction_build(
 	ethereum_transaction: EthereumTransaction,
 	block: Option<EthereumBlock>,
 	status: Option<TransactionStatus>,
-	is_eip1559: bool,
 	base_fee: Option<U256>,
 ) -> Transaction {
 	let mut transaction: Transaction = ethereum_transaction.clone().into();
@@ -400,24 +390,17 @@ fn transaction_build(
 			// If transaction is not mined yet, gas price is considered just max fee per gas.
 			transaction.gas_price = transaction.max_fee_per_gas;
 		} else {
-			// If transaction is already mined, gas price is considered base fee + priority fee.
-			// A.k.a. effective gas price.
-			let base_fee = base_fee.unwrap_or(U256::zero());
-			let max_priority_fee_per_gas =
-				transaction.max_priority_fee_per_gas.unwrap_or(U256::zero());
+			let base_fee = base_fee.unwrap_or_default();
+			let max_priority_fee_per_gas = transaction.max_priority_fee_per_gas.unwrap_or_default();
+			let max_fee_per_gas = transaction.max_fee_per_gas.unwrap_or_default();
+			// If transaction is already mined, gas price is the effective gas price.
 			transaction.gas_price = Some(
 				base_fee
 					.checked_add(max_priority_fee_per_gas)
-					.unwrap_or(U256::max_value()),
+					.unwrap_or_else(U256::max_value)
+					.min(max_fee_per_gas),
 			);
 		}
-	} else if !is_eip1559 {
-		// This is a pre-eip1559 support transaction a.k.a. txns on frontier before we introduced EIP1559 support in
-		// pallet-ethereum schema V2.
-		// They do not include `maxFeePerGas`, `maxPriorityFeePerGas` or `type` fields.
-		transaction.max_fee_per_gas = None;
-		transaction.max_priority_fee_per_gas = None;
-		transaction.transaction_type = None;
 	}
 
 	let pubkey = match public_key(&ethereum_transaction) {
@@ -426,9 +409,9 @@ fn transaction_build(
 	};
 
 	// Block hash.
-	transaction.block_hash = block.as_ref().map_or(None, |block| {
-		Some(H256::from(keccak_256(&rlp::encode(&block.header))))
-	});
+	transaction.block_hash = block
+		.as_ref()
+		.map(|block| H256::from(keccak_256(&rlp::encode(&block.header))));
 	// Block number.
 	transaction.block_number = block.as_ref().map(|block| block.header.number);
 	// Transaction index.
@@ -463,11 +446,9 @@ fn transaction_build(
 		|status| status.to,
 	);
 	// Creates.
-	transaction.creates = status
-		.as_ref()
-		.map_or(None, |status| status.contract_address);
+	transaction.creates = status.as_ref().and_then(|status| status.contract_address);
 	// Public key.
-	transaction.public_key = pubkey.as_ref().map(|pk| H512::from(pk));
+	transaction.public_key = pubkey.as_ref().map(H512::from);
 
 	transaction
 }
